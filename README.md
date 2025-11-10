@@ -62,6 +62,7 @@ python setup.py install --user
 ### DCNv2 (required）
 
 ```bash
+cd lib/models
 git clone https://github.com/lucasjinreal/DCNv2_latest.git
 cd DCNv2_latest
 python setup.py build develop
