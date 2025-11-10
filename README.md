@@ -138,7 +138,7 @@ pip install motmetrics
 Then replace the default parser:
 
 ```bash
-cp ./tools/motmetrics_io/io.py <python_env>/site-packages/motmetrics/io.py
+cp ./motmetrics_io/io.py <python_env>/site-packages/motmetrics/io.py
 ```
 
 Run evaluation:
