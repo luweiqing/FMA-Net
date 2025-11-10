@@ -8,7 +8,7 @@ This repository provides the official code for the paper:
 
 ---
 
-## 🎯 Key Idea
+## 🎯 Key idea
 
 FMA-Net introduces a **motion-sensitive tracking paradigm** tailored for satellite video.  
 The framework consists of:
