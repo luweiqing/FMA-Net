@@ -1,0 +1,363 @@
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+
+import pycocotools.coco as coco
+from pycocotools.cocoeval import COCOeval
+import numpy as np
+import json
+import os
+from collections import defaultdict
+
+import torch.utils.data as data
+import numpy as np
+import torch
+import json
+import cv2
+import os
+from lib.utils.image import flip, color_aug
+from lib.utils.image import get_affine_transform, affine_transform
+from lib.utils.image import gaussian_radius, draw_umich_gaussian, draw_msra_gaussian
+from lib.utils.image import draw_dense_reg
+import math
+from lib.utils.opts import opts
+
+from lib.utils.augmentations import Augmentation
+
+import torch.utils.data as data
+
+
+class COCO(data.Dataset):
+    opt = opts().parse()
+    num_classes = opt.num_classes
+    reg_offset = True
+    mean = np.array([0.49965, 0.49965, 0.49965],
+                    dtype=np.float32).reshape(1, 1, 3)
+    std = np.array([0.08255, 0.08255, 0.08255],
+                   dtype=np.float32).reshape(1, 1, 3)
+
+    def __init__(self, opt, split):
+        super(COCO, self).__init__()
+        self.split = split
+        self.opt = opt
+        self.img_dir0 = self.opt.data_dir  # /dataset/ICPR
+
+        self.img_dir = self.opt.data_dir + split + '/'
+
+        if split == 'train':
+            self.annot_path = os.path.join(
+                self.img_dir0, 'instances_SatMTB_{}_3cate.json').format(split)
+        else:
+            self.annot_path = os.path.join(
+                self.img_dir0, 'instances_SatMTB_{}_3cate.json').format(split)
+
+        self.down_ratio = opt.down_ratio
+        self.max_objs = opt.K
+        self.seqLen = opt.seqLen
+
+
+        self.class_name = [
+            'car', 'airplane', 'ship', 'train']
+        self._valid_ids = [
+            0, 1, 2, 3]
+        self.cat_ids = {v: i for i, v in enumerate(self._valid_ids)}  # 生成对应的category dict
+
+        print('==> initializing MTB-SAT {} data.'.format(split))
+        self.coco = coco.COCO(self.annot_path)
+        self.images = self.coco.getImgIds()  # 获取所有图片的id
+        self.num_samples = len(self.images)  # 图片的数量
+
+        print('Loaded {} {} samples'.format(split, self.num_samples))
+
+        if (split == 'train'):
+            self.aug = Augmentation(opt)
+        else:
+            self.aug = None
+
+    def _to_float(self, x):
+        return float("{:.2f}".format(x))
+
+    # 遍历每一个标注文件解析写入detections. 输出结果使用
+    def convert_eval_format(self, all_bboxes):
+        # import pdb; pdb.set_trace()
+        detections = []
+        for image_id in all_bboxes:
+            for cls_ind in all_bboxes[image_id]:
+                category_id = cls_ind[-2]
+                bbox = cls_ind[:4]
+                score = cls_ind[4]
+                bbox[2] = bbox[2] - bbox[0]
+                bbox[3] = bbox[3] - bbox[1]
+                bbox_out = list(map(self._to_float, bbox[0:4]))
+                detection = {
+                    "image_id": int(image_id),
+                    "category_id": int(category_id),
+                    "bbox": bbox_out,
+                    "score": float("{:.2f}".format(score))
+                }
+                if len(bbox) > 5:
+                    extreme_points = list(map(self._to_float, bbox[5:13]))
+                    detection["extreme_points"] = extreme_points
+                detections.append(detection)
+        return detections
+
+    def __len__(self):
+        return self.num_samples
+
+    def save_results(self, results, save_dir, time_str):
+        output_path = '{}/results_{}.json'.format(save_dir, time_str)
+        with open(output_path, "w") as f:
+            json.dump(self.convert_eval_format(results), f, indent=4)
+
+        print('{}/results_{}.json'.format(save_dir, time_str))
+
+    def run_eval(self, results, save_dir, time_str):
+        self.save_results(results, save_dir, time_str)
+        coco_dets = self.coco.loadRes('{}/results_{}.json'.format(save_dir, time_str))
+        coco_eval = COCOeval(self.coco, coco_dets, "bbox")
+        coco_eval.params.maxDets = [200, 350, 450]
+        # iou_thresholds = [0.3, 0.4, 0.5]
+        # coco_eval.params.iouThrs = iou_thresholds  # 设置自定义的 IOU 阈值
+        coco_eval.evaluate()
+        coco_eval.accumulate()
+        coco_eval.summarize()
+        stats = coco_eval.stats
+        precisions = coco_eval.eval['precision']
+
+        return stats, precisions
+
+    def run_eval_just(self, save_dir, time_str, iouth):
+        coco_dets = self.coco.loadRes('{}/{}'.format(save_dir, time_str))
+        coco_eval = COCOeval(self.coco, coco_dets, "bbox", iouth=iouth)
+        coco_eval.evaluate()
+        coco_eval.accumulate()
+        coco_eval.summarize()
+        stats_5 = coco_eval.stats
+        precisions = coco_eval.eval['precision']
+
+        return stats_5, precisions
+
+    def _coco_box_to_bbox(self, box):
+        if len(box) == 0:
+            return box
+        else:
+            bbox = np.array([box[0], box[1], box[0] + box[2], box[1] + box[3]],
+                            dtype=np.float32)
+            return bbox
+
+    def _get_border(self, border, size):
+        i = 1
+        while size - border // i <= border // i:
+            i *= 2
+        return border // i
+
+    def _get_transoutput(self, c, s, height, width):
+        trans_output = get_affine_transform(c, s, 0, [width, height])
+        return trans_output
+
+    def transform_box(self, bbox, transform, output_w, output_h):
+        bbox[:2] = affine_transform(bbox[:2], transform)
+        bbox[2:] = affine_transform(bbox[2:], transform)
+        h, w = bbox[3] - bbox[1], bbox[2] - bbox[0]
+        h = np.clip(h, 0, output_h - 1)
+        w = np.clip(w, 0, output_w - 1)
+        radius = gaussian_radius((math.ceil(h), math.ceil(w)))
+        radius = max(0, int(radius))
+        ct = np.array(
+            [(bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2], dtype=np.float32)
+        ct[0] = np.clip(ct[0], 0, output_w - 1)
+        ct[1] = np.clip(ct[1], 0, output_h - 1)
+        return bbox, ct, radius
+
+    def process_rel_path(self, path):
+        # 拆分路径
+        path_parts = path.split('/')
+
+        # 检查数字部分是否小于10，如果是，就在前面添加0
+        if int(path_parts[2]) < 10:
+            path_parts[2] = path_parts[2].zfill(2)
+
+        # 检查文件扩展名，如果是.png，就替换为.jpg
+        if path.endswith('.jpg'):
+            path_parts[-1] = path_parts[-1].replace('.jpg', '.png')
+
+        # 重新组合路径
+        new_path = '/'.join(path_parts)
+
+        return new_path
+
+    def process_abs_path(self, file_name):
+        # 使用 os.path.join 连接文件夹和文件名
+        tmp_path = os.path.join(self.img_dir, file_name)
+        # 转换为绝对路径
+        absolute_path = os.path.abspath(tmp_path)
+        # 使用 replace() 函数替换路径中的部分内容
+        img_path = absolute_path.replace('/lib/dataset', '')
+
+        return img_path
+
+    def __getitem__(self, index):
+        img_id = self.images[index]  # 从self.images列表中获取第index个图像的ID。
+        file_name = self.coco.loadImgs(ids=[img_id])[0]['file_name']  # img/airplane/11/000001.png
+        file_name = self.process_rel_path(file_name)  # jpg替换成了png
+        ann_ids = self.coco.getAnnIds(imgIds=[img_id])  # 使用COCO API的getAnnIds方法获取当前图像的所有标注物体的ID。
+        anns = self.coco.loadAnns(ids=ann_ids)  # 使用COCO API的loadAnns方法加载所有注释。
+        num_objs = min(len(anns), self.max_objs)  # 计算图像的注释数量，但不超过self.max_objs。
+
+        seq_num = self.seqLen
+        imIdex = int(file_name.split('.')[0].split('/')[-1])  # 1  从文件名中提取图像的索引
+        imf = file_name.split(file_name.split('/')[-1])[0]  # img/airplane/11/  从文件名中提取图像的文件夹
+        imtype = '.' + file_name.split('.')[-1]  # .png
+        img_path = self.process_abs_path(file_name)
+        im0 = cv2.imread(img_path)
+        img = np.zeros([im0.shape[0], im0.shape[1], 3, seq_num])  # 创建一个形状为[im0.shape[0], im0.shape[1], 3, seq_num]的零数组。
+
+        pre_revrs_ids = []  # len(pre_img_ids) = seq_num - 1 创建一个空列表，用于存储前一个图像的ID
+        interval = []  # len(interval) = seq_num - 1 创建一个空列表，用于存储两个图像之间的间隔
+        temp_id = img_id  # 创建一个变量temp_id，用于存储当前图像的ID
+
+        for ii in range(seq_num):
+            # 0, 1, ..., seq_num - 1
+            imIndexNew = '%06d' % max(imIdex - seq_num + ii + 1, 1)  # 从当前图像的ID中减去ii，然后加上1，然后将其格式化为6位数。
+            imName = imf + imIndexNew + imtype  # 生成新的图像文件名。
+            if ii <= imIdex - 1:  # 如果当前循环次数小于等于图像索引减1，则执行下面的代码。
+                temp_id = img_id - ii  # 计算临时ID。
+            if ii != 0:
+                pre_revrs_ids.append(temp_id)
+                interval.append(img_id - temp_id)
+            read_path = self.process_abs_path(imName)
+            im = cv2.imread(read_path)
+            # normalize
+            inp_i = (im.astype(np.float32) / 255.)  # 将图像转换为浮点数数组，并将其除以255。归一化
+            inp_i = (inp_i - self.mean) / self.std
+            img[:, :, :, ii] = inp_i  # 存储图像序列中的所有图像到img数组中。  最后一层（4）是当前图像，前面的（0，1，2，3）是前面的图像
+
+        pre_anns = defaultdict(list)  # 存储图像序列中除当前图像外其他图像中所有物体的标注信息
+        for ii in range(seq_num - 1):
+            pre_ann_ids = self.coco.getAnnIds(imgIds=pre_revrs_ids[seq_num - 2 - ii])
+            pre_anns[ii] = self.coco.loadAnns(ids=pre_ann_ids)  # ..., N-2, N-1
+
+        bbox_tol = []
+        cls_id_tol = []
+        ids_tol = []
+        for k in range(num_objs):
+            ann = anns[k]
+            bbox_tol.append(self._coco_box_to_bbox(ann['bbox']))  ## [x1, y1, x2, y2]
+            cls_id_tol.append(self.cat_ids[ann['category_id']])  ## 0, 1, 2, 3
+            ids_tol.append(int(ann['obj_id']))  ##
+
+        # get box and id of pre annotations
+        pre_bboxes = defaultdict(list)
+        pre_ids = defaultdict(list)
+        for i in range(seq_num - 1):
+            for k in range(len(pre_anns[i])):
+                anns = pre_anns[i][k]
+                pre_bboxes[i + 1].append(self._coco_box_to_bbox(anns['bbox']))
+                pre_ids[i + 1].append(int(anns['obj_id']))
+
+
+        if self.aug is not None:
+            bbox_tol = np.array(bbox_tol)
+            cls_id_tol = np.array(cls_id_tol)
+            ids_tol = np.array(ids_tol)
+            for i in range(seq_num - 1):
+                pre_bboxes[i + 1] = np.array(pre_bboxes[i + 1])
+                pre_ids[i + 1] = np.array(pre_ids[i + 1])
+            img, _, bbox_tol, cls_id_tol, ids_tol, pre_bboxes, pre_ids = self.aug(img, img, bbox_tol, cls_id_tol,
+                                                                                      ids_tol, pre_bboxes, pre_ids)
+
+            bbox_tol = bbox_tol.tolist()
+            cls_id_tol = cls_id_tol.tolist()
+            ids_tol = ids_tol.tolist()
+            for i in range(seq_num - 1):
+                pre_bboxes[i + 1] = pre_bboxes[i + 1].tolist()
+                pre_ids[i + 1] = pre_ids[i + 1].tolist()
+            num_objs = len(bbox_tol)  ####进行图像增强，缩放和旋转等一系列的变换操作
+        # transpose
+        inp = img.transpose(3, 2, 0, 1).astype(
+            np.float32)  # img为输入的图像序列，将其转置为[seq_num, 3, im0.shape[0], im0.shape[1]]的浮点数数组作为输入。
+
+
+        height, width = img.shape[0] - img.shape[0] % 32, img.shape[1] - img.shape[1] % 32  # 计算图像的高度和宽度
+        inp = inp[:, :, 0:height, 0:width]
+
+        c = np.array([width / 2., height / 2.], dtype=np.float32)
+        s = max(width, height) * 1.0
+        ret = {'input': inp}
+
+
+        down_ratios = [1]
+        for ratio in down_ratios:
+            output_h = height // ratio // self.down_ratio
+            output_w = width // ratio // self.down_ratio
+            trans_output = self._get_transoutput(c, s, output_h, output_w)  #
+
+            hm = np.zeros((seq_num, self.num_classes, output_h, output_w), dtype=np.float32)
+            hm_seq = np.zeros((seq_num, 1, output_h, output_w), dtype=np.float32)
+            wh = np.zeros((self.max_objs, 2), dtype=np.float32)
+            reg = np.zeros((self.max_objs, 2), dtype=np.float32)
+            ind = np.zeros((self.max_objs), dtype=np.int64)
+            reg_mask = np.zeros((self.max_objs), dtype=np.uint8)
+
+            gt_det = []
+            for k in range(num_objs):
+                bbox = bbox_tol[k]
+                cls_id = cls_id_tol[k]
+                obj_id = ids_tol[k]
+                bbox[:2] = affine_transform(bbox[:2], trans_output)
+                bbox[2:] = affine_transform(bbox[2:], trans_output)
+
+                h, w = bbox[3] - bbox[1], bbox[2] - bbox[0]
+                h = np.clip(h, 0, output_h - 1)  ##
+                w = np.clip(w, 0, output_w - 1)
+                if h > 0 and w > 0:
+                    for i in range(1, seq_num):  # 1, 2, ..., seq_num - 1
+                        if i != seq_num - 1:
+                            if pre_ids[i].count(obj_id) != 0 and pre_ids[i + 1].count(obj_id) != 0:
+                                temp_ind_pre = pre_ids[i].index(obj_id)
+                                temp_box_pre = pre_bboxes[i][temp_ind_pre]
+
+                                temp_box_pre, ct_pre, radius_pre = self.transform_box(temp_box_pre, trans_output,
+                                                                                      output_w, output_h)
+
+                                ct_int_pre = ct_pre.astype(np.int32)
+
+                                draw_umich_gaussian(hm[i - 1][cls_id], ct_int_pre, radius_pre)
+                                draw_umich_gaussian(hm_seq[i - 1][0], ct_int_pre, radius_pre)
+
+
+                        else:
+                            if pre_ids[i].count(obj_id) != 0:
+                                temp_ind_pre = pre_ids[i].index(obj_id)
+                                temp_box_pre = pre_bboxes[i][temp_ind_pre]
+
+                                temp_box_pre, ct_pre, radius_pre = self.transform_box(temp_box_pre, trans_output,
+                                                                                      output_w, output_h)
+                                ct_int_pre = ct_pre.astype(np.int32)
+                                draw_umich_gaussian(hm[i - 1][cls_id], ct_int_pre, radius_pre)
+                                draw_umich_gaussian(hm_seq[i - 1][0], ct_int_pre, radius_pre)
+
+
+                    radius = gaussian_radius((math.ceil(h), math.ceil(w)))
+                    radius = max(0, int(radius))
+                    ct = np.array(
+                        [(bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2], dtype=np.float32)
+                    ct[0] = np.clip(ct[0], 0, output_w - 1)
+                    ct[1] = np.clip(ct[1], 0, output_h - 1)
+                    ct_int = ct.astype(np.int32)
+                    draw_umich_gaussian(hm[seq_num - 1][cls_id], ct_int, radius)
+                    draw_umich_gaussian(hm_seq[seq_num - 1][0], ct_int, radius)
+                    wh[k] = 1. * w, 1. * h
+                    ind[k] = ct_int[1] * output_w + ct_int[0]  # 计算当前物体的中心点在heatmap中的索引  相当于将二维坐标拉直转换为一维坐标
+                    reg[k] = ct - ct_int
+                    reg_mask[k] = 1
+                    gt_det.append([ct[0] - w / 2, ct[1] - h / 2,
+                                   ct[0] + w / 2, ct[1] + h / 2, 1, cls_id])
+            ret[ratio] = {'hm': hm, 'hm_seq': hm_seq, 'reg_mask': reg_mask, 'ind': ind, 'wh': wh, 'reg': reg}
+
+        for kkk in range(num_objs, self.max_objs):
+            bbox_tol.append([])
+
+        ret['file_name'] = file_name
+
+        return img_id, ret
