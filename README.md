@@ -19,7 +19,7 @@ The framework consists of:
 | **MAF** | Aggregates multi-frame features guided by motion sensitivity |
 | **MAR** | Refines association and preserves identity continuity |
 
-Experiments on **SatVideoDT** and **SatMTB** confirm that FMA-Net establishes **state-of-the-art performance** across both detection and tracking metrics.
+Experiments on **SatVideoDT** and **SatMTB** confirm that FMA-Net establishes **state-of-the-art performance** across tracking metrics.
 
 ---
 
