@@ -48,7 +48,7 @@ pip install -r requirements.txt
 ```bash
 pip install -U openmim
 pip install mmcv-full==1.7.0 -f https://download.openmmlab.com/mmcv/dist/cu116/torch1.12/index.html
-mim install mmdet==2.25.1
+pip install mmdet==2.25.1
 ```
 
 ### COCOAPI (required）
