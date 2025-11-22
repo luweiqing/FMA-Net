@@ -161,7 +161,7 @@ We sincerely appreciate the contributions of the following open-source projects:
 ---
 
 ## 📝 Citation
-
+If our paper or code proves useful to your work, we would greatly appreciate your citation and a star for this repository.
 ```bibtex
 @ARTICLE{11214536,
   author={Lu, Weiqing and Sun, Bin and Li, Shutao and Li, Xiliang},
