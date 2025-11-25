@@ -360,10 +360,10 @@ class DLA(nn.Module):
             inplanes = planes
         return nn.Sequential(*modules)
 
-    def forward(self, x, gru):
+    def forward(self, x, temporal_feat):
         y = []
         x = self.base_layer(x)
-        x = x + gru
+        x = x + temporal_feat
         for i in range(5):
             x = getattr(self, 'level{}'.format(i))(x)
             y.append(x)
@@ -622,34 +622,29 @@ class DLASeg(nn.Module):
         current_frame_features = self.backbone(x, c0[:, i])
         mask_fused_feats = self.mask_guided_fusion(displacement_map, pre_frame_features, current_frame_features)
         p0, p1, p2, p3, _ = self.dla_up(mask_fused_feats)
-
         y = [p0, p1, p2]
         self.ida_up(y, 0, len(y))
         p0 = y[-1]
-        # save_feature_map(p0, 'vis', seq_id, frame_idx, 'after_fusion', mode='max')
 
         return current_frame_features, p0, p1, p2, p3
 
-    def track_feat(self, x, c0, i, N, mask, new_mask=None, pre_frame_features=None, pre_frame_features2=None):
+    def track_feat(self, x, c0, i, N, displacement_map=None, pre_frame_features=None):
         B, _, H, W = x.shape
 
         if self.prev_state != False and i < N - 1:
             return self.prev_feat[i + 1][0], self.prev_feat[i + 1][1], self.prev_feat[i + 1][2], self.prev_feat[i + 1][
                 3], self.prev_feat[i + 1][4]
         else:
+            if displacement_map == None:
+                displacement_map = torch.zeros((B, 2, H, W), dtype=torch.float32, device=x.device)
             current_frame_features = self.backbone(x, c0[:, i])
-            mask_fused_feats = self.mask_guided_fusion(mask, pre_frame_features, current_frame_features)
-            mask_fused_feats_copy = [feat.clone() for feat in mask_fused_feats]
-            p0, p1, p2, p3, _ = self.dla_up(mask_fused_feats_copy)
-
-            if new_mask is None:
-                new_mask = mask
-
+            mask_fused_feats = self.mask_guided_fusion(displacement_map, pre_frame_features, current_frame_features)
+            p0, p1, p2, p3, _ = self.dla_up(mask_fused_feats)
             y = [p0, p1, p2]
             self.ida_up(y, 0, len(y))
             p0 = y[-1]
 
-            return mask_fused_feats, p0, p1, p2, p3
+            return current_frame_features, p0, p1, p2, p3
 
     def flow_driven_motion_estimator(self, curr_frame, next_frame, obj_info, r):
 
@@ -757,8 +752,12 @@ class DLASeg(nn.Module):
         for i in range(N):
             x = img_input[:, i, :]
             # Extract current frame features using backbone
-            pre_features, p0, p1, p2, p3 = self.train_feat(x, c0_input, i, final_map, pre_frame_features)
-            temp_feat.append([pre_features, p0, p1, p2, p3])
+            if training:
+                pre_features, p0, p1, p2, p3 = self.train_feat(x, c0_input, i, final_map, pre_frame_features)
+                temp_feat.append([pre_features, p0, p1, p2, p3])
+            else:
+                pre_features, p0, p1, p2, p3 = self.track_feat(x, c0_input, i, N, final_map, pre_frame_features)
+                temp_feat.append([pre_features, p0, p1, p2, p3])
 
             pre_frame_features = pre_features
 
@@ -776,7 +775,6 @@ class DLASeg(nn.Module):
             if i < N - 1:
                 # 处理当前帧和下一帧
                 final_map = self.flow_driven_motion_estimator(img_input[:, i], img_input[:, i + 1], obj_info, self.radius_mapping)
-
             else:
                 final_map = None
             # construct sequence
